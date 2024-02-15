@@ -2,15 +2,14 @@ import torch.optim as optim
 import math
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
 import torch.nn as nn
-import torch.nn.functional as F
 import torchvision.transforms as tt
-from torchvision.utils import make_grid
 from torch.utils.data.dataloader import DataLoader
-from torch.utils.data import random_split, ConcatDataset
 from torchvision.datasets import ImageFolder
-from PIL import Image
+from torch.nn.modules.container import ModuleList
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+
 
 train_transform = tt.Compose([
     # tt.RandomHorizontalFlip(),
@@ -23,8 +22,8 @@ test_transform = tt.Compose([
     tt.ToTensor(),
     # tt.Normalize(*stats)
 ])
-#Dataset can be downloaded from: 
-#https://drive.google.com/file/d/1Rxnz6A6U9qHCBL8-S5AttLMyMJPw6YR7/view?usp=sharing
+# Dataset can be downloaded from:
+# https://drive.google.com/file/d/1Rxnz6A6U9qHCBL8-S5AttLMyMJPw6YR7/view?usp=sharing
 
 # PyTorch datasets
 data_dir = r"/home/fberanek/Desktop/datasets/classification/cifar100"
@@ -32,7 +31,7 @@ train_data = ImageFolder(data_dir+'/train', train_transform)
 test_data = ImageFolder(data_dir+'/test', test_transform)
 
 # Create pytorch dataloaders
-BATCH_SIZE = 1
+BATCH_SIZE = 2
 train_dl = DataLoader(train_data, BATCH_SIZE, num_workers=4, pin_memory=True, shuffle=True)
 test_dl = DataLoader(test_data, BATCH_SIZE, num_workers=4, pin_memory=True)
 
@@ -159,7 +158,7 @@ class Img2Seq(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model: int = 512, n_heads: int = 8, dropout: float = 0.1):
+    def __init__(self, d_model: int = 512, n_heads: int = 8, dropout: float = 0, device="cuda"):
         """
         Args:
             d_model:      dimension of embeddings
@@ -172,12 +171,20 @@ class MultiHeadAttention(nn.Module):
         self.n_heads = n_heads                   # 8 heads
         self.d_key = d_model // n_heads          # assume d_value equals d_key | 512/8=64
 
-        self.Wq = nn.Linear(d_model, d_model)    # query weights
-        self.Wk = nn.Linear(d_model, d_model)    # key weights
-        self.Wv = nn.Linear(d_model, d_model)    # value weights
-        self.Wo = nn.Linear(d_model, d_model)    # output weights
+        self.n_heads = n_heads
 
-        self.dropout = nn.Dropout(p=dropout)     # initialize dropout layer
+        self.Wq = []
+        self.Wk = []
+        self.Wv = []
+        self.Wo = nn.Linear(int(d_model*n_heads), d_model)
+
+        for head_id in range(self.n_heads):
+            self.Wq.append(nn.Linear(d_model, d_model))    # query weights
+            self.Wk.append(nn.Linear(d_model, d_model))    # key weights
+            self.Wv.append(nn.Linear(d_model, d_model))    # value weights
+        self.Wq = ModuleList(self.Wq)
+        self.Wk = ModuleList(self.Wk)
+        self.Wv = ModuleList(self.Wv)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None):
         """
@@ -191,64 +198,38 @@ class MultiHeadAttention(nn.Module):
            output:        attention values     (batch_size, q_length, d_model)
            attn_probs:    softmax scores       (batch_size, n_heads, q_length, k_length)
         """
-        batch_size = x.size(0)
-
         # calculate query, key, and value tensors
         # This is part 1, where we create Query, Key, Values
-        Q = self.Wq(x)                       # (1, 17, 512) x (512, 512) = (1, 17, 512)
-        K = self.Wk(x)                       # (1, 17, 512) x (512, 512) = (1, 17, 512)
-        V = self.Wv(x)                       # (1, 17, 512) x (512, 512) = (1, 17, 512)
 
-        # split each tensor into n-heads to compute attention !!!!
-        # As you see here, we tak original matrix and extend it by number of heads
-        # query tensor
-        Q = Q.view(batch_size,                   # (1, 17, 512) -> (1, 17, 8, 64)
-                   -1,                           # -1 = q_length
-                   self.n_heads,
-                   self.d_key
-                   ).permute(0, 2, 1, 3)         # (1, 17, 8, 64) -> (1, 8, 17, 64) = (batch_size, n_heads, q_length, d_key)
-        # key tensor
-        K = K.view(batch_size,                   # (1, 17, 512) -> (1, 17, 8, 64)
-                   -1,                           # -1 = k_length
-                   self.n_heads,
-                   self.d_key
-                   ).permute(0, 2, 1, 3)         # (1, 17, 8, 64) -> (1, 8, 17, 64) = (batch_size, n_heads, k_length, d_key)
-        # value tensor
-        V = V.view(batch_size,                   # (1, 17, 512) -> (1, 17, 8, 64)
-                   -1,                           # -1 = v_length
-                   self.n_heads,
-                   self.d_key
-                   ).permute(0, 2, 1, 3)         # (1, 17, 8, 64) -> (1, 8, 17, 64) = (batch_size, n_heads, v_length, d_key)
+        output_of_multi_head = []
 
-        # computes attention
-        # scaled dot product -> QK^{T}
-        scaled_dot_prod = torch.matmul(Q,        # (1, 8, 17, 64) x (1, 8, 64, 17) -> (1, 8, 17, 17) = (batch_size, n_heads, q_length, k_length)
-                                       K.permute(0, 1, 3, 2)
-                                       ) / math.sqrt(self.d_key)      # sqrt(64)
+        for head_id, (Wq, Wk, Wv) in enumerate(zip(self.Wq, self.Wk, self.Wv)):
 
-        # fill those positions of product as (-1e10) where mask positions are 0
-        if mask is not None:
-            scaled_dot_prod = scaled_dot_prod.masked_fill(mask == 0, -1e10)
+            Q = Wq(x)                      # (1, 17, 512) x (512, 512) = (1, 17, 512)
+            K = Wk(x)                       # (1, 17, 512) x (512, 512) = (1, 17, 512)
+            V = Wv(x)                       # (1, 17, 512) x (512, 512) = (1, 17, 512)
 
-        # apply softmax
-        attn_probs = torch.softmax(scaled_dot_prod, dim=-1)
+            # scaled dot product -> QK^{T}
+            scaled_dot_prod = torch.matmul(Q,        # (1, 8, 17, 64) x (1, 8, 64, 17) -> (1, 8, 17, 17) = (batch_size, n_heads, q_length, k_length)
+                                           K.permute(0, 2, 1)
+                                           ) / math.sqrt(self.d_key)
 
-        # multiply by values to get attention
-        A = torch.matmul(self.dropout(attn_probs), V)       # (1, 8, 17, 17) x (1, 8, 17, 64) -> (1, 8, 17, 64)
-        # (batch_size, n_heads, q_length, k_length) x (batch_size, n_heads, v_length, d_key) -> (batch_size, n_heads, q_length, d_key)
+            # apply softmax
+            attn_probs = torch.softmax(scaled_dot_prod, dim=-1)
 
-        # reshape attention back to (1, 17, 512)
-        # Here we only move axis with head onto to third place
-        A = A.permute(0, 2, 1, 3).contiguous()              # (1, 8, 17, 64) -> (1, 17, 8, 64)
-        # And squeeze one two axis into one
-        # (1, 17, 8, 64) -> (1, 17, 8*64) -> (1, 17, 512) = (batch_size, q_length, d_model)
-        A = A.view(batch_size, -1, self.n_heads*self.d_key)
-        # And we have same shape as before
+            # multiply by values to get attention
+            A = torch.matmul(attn_probs, V)
 
-        # push through the final weight layer
-        output = self.Wo(A)                                 # (32, 10, 512) x (512, 512) = (32, 10, 512)
+            # Add to the list
+            output_of_multi_head.append(A)
 
-        return output, attn_probs                           # return attn_probs for visualization of the scores
+        # Concatenate all features
+        concat_A = torch.cat(output_of_multi_head, -1)
+
+        # Last layer
+        output = self.Wo(concat_A)
+
+        return output
 
 
 class ViT(nn.Module):
@@ -262,7 +243,9 @@ class ViT(nn.Module):
         dim_feedforward,
         mlp_head_units,
         n_classes,
-        batch_size
+        batch_size,
+        device,
+        sin_cos_position
     ):
         super().__init__()
         """
@@ -277,9 +260,10 @@ class ViT(nn.Module):
         """
         num_of_patches = int(img_size[0]*img_size[1]/patch_size[0]/patch_size[1]+1)
         # Get image sequencing
-        self.img2seq = Img2Seq(img_size, patch_size, n_channels, d_model, verbose=False, device=device)
+        self.img2seq = Img2Seq(img_size, patch_size, n_channels, d_model,
+                               verbose=False, device=device, sin_cos_position=sin_cos_position)
         # Get multi head attention
-        self.multihead = MultiHeadAttention(d_model, nhead, 0.1)
+        self.multihead = MultiHeadAttention(d_model, nhead, 0.0, device=device)
         # Get feed forwad that will be used for Multi-Head Attention
         self.mlp = get_mlp(d_model, mlp_head_units, d_model)
         # Get Multi-head Attention
@@ -304,7 +288,7 @@ class ViT(nn.Module):
         # And Positional aencoding according https://arxiv.org/pdf/1706.03762.pdf
         batch = self.img2seq(batch)
         # Run Multi-Head Attentnion according https://medium.com/@hunter-j-phillips/multi-head-attention-7924371d477a
-        multihead_batch, attn_probs = self.multihead(batch)
+        multihead_batch = self.multihead(batch)
         # Add Embeddings to the ooutputs of Multi-Head Attention and normalize
         batch = self.norm_after_multi_hear(batch+multihead_batch)
         # Run feed forward
@@ -320,36 +304,16 @@ class ViT(nn.Module):
         return batch
 
 
-img_size = (32, 32)
-patch_size = (8, 8)
-n_channels = 3
-d_model = 512
-nhead = 8
-dim_feedforward = 1024
-blocks = 8
-mlp_head_units = [1024, 512]
-n_classes = 100
-device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+def define_loss_canvas():
+    pass
 
 
-criterion = nn.CrossEntropyLoss()
-
-
-net = ViT(img_size,
-          patch_size,
-          n_channels,
-          d_model,
-          nhead,
-          dim_feedforward,
-          mlp_head_units,
-          100,  # len(train_data.classes),
-          BATCH_SIZE).to(device)
-optimizer = optim.Adam(net.parameters(), lr=0.0001)
-print(net)
-
-for epoch in range(2):  # loop over the dataset multiple times
-
-    running_loss = 0.0
+def train(epoch):
+    if len(xdata) == 0:
+        current_epoch = 0
+    else:
+        current_epoch = max(xdata)+1
+    running_loss = []
     for i, data in enumerate(train_dl, 0):
         # get the inputs; data is a list of [inputs, labels]
         inputs, labels = data
@@ -361,11 +325,63 @@ for epoch in range(2):  # loop over the dataset multiple times
         # forward + backward + optimize
         outputs = net(inputs)
         loss = criterion(outputs, labels)
+        loss_history.append(loss.cpu().detach().numpy())
         loss.backward()
         optimizer.step()
+        # print(net.img2seq.linear.weight[0][0:5])
 
         # print statistics
-        running_loss += loss.item()
-        if i % 2000 == 1999:    # print every 2000 mini-batches
-            print(f'[{epoch + 1}, {i + 1:5d}] loss: {running_loss / 2000:.3f}')
-            running_loss = 0.0
+        running_loss.append(loss.item())
+    print(f'epoch: {current_epoch} loss: {np.mean(running_loss):.3f}')
+    xdata.append(current_epoch)
+    ydata.append(np.mean(running_loss))
+    ln.set_data(xdata, ydata)
+    # recompute the ax.dataLim
+    ax.relim()
+    # update ax.viewLim using the new dataLim
+    ax.autoscale_view()
+    return ln,
+
+
+if __name__ == "__main__":
+    img_size = (32, 32)
+    patch_size = (8, 8)
+    n_channels = 3
+    d_model = 512
+    nhead = 8
+    dim_feedforward = 1024
+    blocks = 8
+    mlp_head_units = [1024, 512]
+    n_classes = 100
+    n_of_epochs = 30
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+    criterion = nn.CrossEntropyLoss()
+
+    net = ViT(img_size,
+              patch_size,
+              n_channels,
+              d_model,
+              nhead,
+              dim_feedforward,
+              mlp_head_units,
+              len(train_data.classes),
+              BATCH_SIZE,
+              device,
+              False).to(device)
+    # optimizer = optim.Adam(net.parameters(), lr=0.0001)
+    optimizer = optim.SGD(net.parameters(), lr=0.1, momentum=0.9)
+    print(net)
+
+    fig, ax = plt.subplots()
+    xdata, ydata = [], []
+    ln, = ax.plot([], [], 'r-')
+
+    loss_history = []
+    ani = FuncAnimation(fig, train, frames=np.linspace(0, n_of_epochs, n_of_epochs+1),
+                        repeat=False,
+                        # init_func=init,
+                        # blit=True
+                        )
+    plt.show()
+    plt.close("all")
